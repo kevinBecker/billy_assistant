@@ -9,6 +9,8 @@ from motor_mgr import motor_on, motor_stop
 # Track the current tasks so we can cancel them
 current_thinking_task = None
 current_listening_task = None
+current_tts_speaking_task = None
+last_event = ""
 
 
 def log(message):
@@ -59,22 +61,34 @@ async def main():
                         log("→ Starting listening task")
                         current_listening_task = asyncio.create_task(listening())
                     elif event == "tts_speaking":
-                        log("→ Executing tts_speaking()")
-                        await tts_speaking()
+                        log("→ Starting tts_speaking task")
+                        current_tts_speaking_task = asyncio.create_task(tts_speaking())
                     elif event == "tts_finished":
+                        # Cancel any running speaking task
+                        if current_tts_speaking_task and not current_tts_speaking_task.done():
+                            log(f"Cancelling tts_speaking due to tts_finished event")
+                            current_tts_speaking_task.cancel()
+                            current_tts_speaking_task = None
                         log("→ Executing tts_finished()")
                         await tts_finished()
                     elif event == "thinking":
                         log("→ Starting thinking task")
                         current_thinking_task = asyncio.create_task(thinking())
                     elif event == "idle":
-                        log("→ Executing idle()")
+                        # Don't idle after tts_finished
+                        if last_event != "tts_finished":
+                            log("→ Executing idle()")
+                            await idle()
+                    elif event == "pipeline_error":
+                        log("→ Pipeline error, idle()")
                         await idle()
                     elif event in ["stt_text", "tts_text", "snapshot"]:
                         # These are informational events, just log them
                         pass
                     else:
                         log(f"⚠ Unknown event: {event}")
+                    last_event = event
+                    
 
         except ConnectionRefusedError:
             log("❌ Error: Could not connect to websocket server at ws://localhost:6055")
@@ -90,10 +104,10 @@ async def main():
 async def iwake_word_detected():
     """Pulse head forward, pulse mouth open"""
     log("  → Pulsing head forward...")
-    motor_on(500, "head", 1)
+    motor_on(750, "head", 1)
     await asyncio.sleep(0.1)
-    log("  → Pulsing mouth open...")
-    motor_on(300, "mouth", 1)
+    log("  → Pulsing mouth closed...")
+    motor_on(300, "mouth", -1)
     log("  ✓ wake_word_detected complete")
 
 
@@ -101,7 +115,7 @@ async def listening():
     """Continuously flap tail until cancelled"""
     log("  → Starting continuous tail flapping...")
     motor_on(300, "mouth", -1)
-    
+
     # Tail flap while listening:
     # try:
     #     while True:
@@ -121,9 +135,7 @@ async def thinking():
     timeout_seconds = 5.0
     start_time = time.time()
     pulse_count = 0
-
     log(f"  → Starting thinking loop (timeout: {timeout_seconds}s)")
-
     try:
         while (time.time() - start_time) < timeout_seconds:
             motor_on(300, "tail", 1)
@@ -142,26 +154,47 @@ async def thinking():
 
 async def tts_speaking():
     """Pulse mouth open"""
-    log("  → Pulsing mouth open...")
-    motor_on(300, "mouth", 1)
-    log("  ✓ tts_speaking complete")
+    timeout_seconds = 10.0 # max speaking time
+    start_time = time.time()
+    pulse_count = 0
+    try:
+        while (time.time() - start_time) < timeout_seconds:
+            motor_on(300, "mouth", 1)
+            await asyncio.sleep(0.150)
+            motor_on(300, "mouth", -0.5)
+            await asyncio.sleep(0.150)
+            pulse_count += 1
 
+        log(f"  ✓ talking complete ({pulse_count} pulses)")
+    except asyncio.CancelledError:
+        # Task was cancelled (new event received)
+        motor_on(300, "mouth", -0.5)
+        await asyncio.sleep(0.150)
+        motor_stop("mouth")
+        log(f"  ⚠ Talking interrupted after {pulse_count} pulses")
+        raise
 
 async def tts_finished():
     """Close mouth and retract head"""
     log("  → Closing mouth...")
-    motor_on(300, "mouth", -1)
-    await asyncio.sleep(1.0)
+    motor_on(500, "mouth", -1)
+    await asyncio.sleep(1.0)  # Pause before retracting head
     log("  → Retracting head...")
     motor_on(500, "head", -1)
+    # Flap tail for good measure
+    motor_on(300, "tail", 1)
+    await asyncio.sleep(0.150)
+    motor_on(300, "tail", -1)
+    await asyncio.sleep(0.500)
     log("  ✓ tts_finished complete")
 
 
 async def idle():
     """Return all motors to neutral position"""
     log("  → Returning all motors to neutral...")
-    for x in ["mouth", "head", "tail"]:
-        motor_on(500, x, -1)
+    motor_on(25, "mouth", -1)
+    motor_on(50, "head", -1)
+    motor_on(50, "tail", -1)
     await asyncio.sleep(1)
 
     log("  → Stopping all motors...")
